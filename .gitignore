@@ -1,6 +1,5 @@
+# Raw data is not redistributed; regenerate it with src/farside_to_csv.py
+data/*.csv
 __pycache__/
 *.pyc
-.DS_Store
-.ipynb_checkpoints/
 .venv/
-.env

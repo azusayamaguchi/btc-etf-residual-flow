@@ -1,13 +1,17 @@
 """
-Raw flows don't predict, residuals do: US spot Bitcoin ETF flows vs. BTC returns.
+Raw flows don't predict, residuals do: US spot crypto ETF flows vs. next-day returns.
 
 Usage
 -----
     # Offline demo with synthetic data (no network)
     python src/btc_etf_flow_analysis.py --demo
 
-    # Real data: flows from a Farside CSV (see farside_to_csv.py), prices from Coinbase
-    python src/btc_etf_flow_analysis.py --flows data/farside_btc_flows.csv --start 2024-01-11
+    # BTC: flows from a Farside CSV (see farside_to_csv.py), prices from Coinbase
+    python src/btc_etf_flow_analysis.py --asset BTC --flows data/farside_btc_flows.csv
+
+    # ETH, controlling for BTC residual flow (independent replication)
+    python src/btc_etf_flow_analysis.py --asset ETH --flows data/farside_eth_flows.csv \
+        --control-flows data/farside_btc_flows.csv
 
     # Real data, scraping the recent Farside table directly
     python src/btc_etf_flow_analysis.py --start 2026-01-01
@@ -17,6 +21,7 @@ Requirements: pandas numpy scipy statsmodels matplotlib requests beautifulsoup4
 from __future__ import annotations
 
 import argparse
+import time
 import re
 
 import matplotlib.pyplot as plt
@@ -87,8 +92,9 @@ def load_farside_flows(start: str, end: str | None) -> pd.DataFrame:
     return flows
 
 
-def load_hourly(start: str, end: str | None) -> pd.Series:
-    """Coinbase BTC-USD hourly closes, indexed by candle END time (ET). Completed candles only."""
+def load_hourly(start: str, end: str | None, product: str = "BTC-USD") -> pd.Series:
+    """Coinbase hourly closes (e.g. BTC-USD, ETH-USD), indexed by candle END time (ET).
+    Completed candles only."""
     import requests
 
     start_utc = pd.Timestamp(start, tz=ET).tz_convert("UTC")
@@ -96,16 +102,22 @@ def load_hourly(start: str, end: str | None) -> pd.Series:
     if end_utc <= start_utc:
         raise ValueError("end must be later than start")
 
-    url = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+    url = f"https://api.exchange.coinbase.com/products/{product}/candles"
     rows = []
     with requests.Session() as session:
         t = start_utc
         while t < end_utc:
             stop = min(t + pd.Timedelta(hours=299), end_utc)   # API returns at most 300 candles
-            r = session.get(url, timeout=30, params={
-                "start": t.isoformat(), "end": stop.isoformat(), "granularity": 3600})
-            r.raise_for_status()
+            for attempt in range(6):                             # back off on rate limit (429)
+                r = session.get(url, timeout=30, params={
+                    "start": t.isoformat(), "end": stop.isoformat(), "granularity": 3600})
+                if r.status_code == 429 and attempt < 5:
+                    time.sleep(2 ** attempt)
+                    continue
+                r.raise_for_status()
+                break
             data = r.json()
+            time.sleep(0.2)                                      # stay under the public limit
             if not isinstance(data, list):
                 raise RuntimeError(f"Coinbase API error: {data}")
             rows.extend(data)
@@ -123,7 +135,7 @@ def load_hourly(start: str, end: str | None) -> pd.Series:
 
 
 def load_price_at_close(hourly: pd.Series) -> pd.Series:
-    """Daily BTC price at 16:00 ET (close of the 15:00-16:00 candle), the ETF NAV strike time."""
+    """Daily price at 16:00 ET (close of the 15:00-16:00 candle), the ETF NAV strike time."""
     at16 = hourly[(hourly.index.hour == 16) & (hourly.index.minute == 0)]
     price = at16.copy()
     price.index = at16.index.normalize().tz_localize(None)
@@ -265,6 +277,41 @@ def divergence_test(df: pd.DataFrame, horizon: int = 5, n_perm: int = 5000, seed
     print(f"circular-shift permutation p-value: {pval:.3f} ({n_perm} shifts)")
 
 
+# ============================================================ cross-asset control
+def cross_asset_test(df: pd.DataFrame, ctrl: pd.DataFrame, name: str = "ETH", ctrl_name: str = "BTC") -> None:
+    """
+    Is the next-day effect of `name` residual flow independent of `ctrl_name` residual flow?
+    Both residuals are built with their own out-of-sample flow model. The next-day return
+    of `name` is regressed on
+      (1) own residual flow
+      (2) own + control residual flow
+      (3) own + control residual flow + same-day returns of both assets
+    """
+    eps = flow_residual(df).rename(f"eps_{name}")
+    eps_c = flow_residual(ctrl).rename(f"eps_{ctrl_name}")
+    z = pd.concat([df["ret"].shift(-1).rename("ret_next"), eps, eps_c,
+                   df["ret"].rename(f"ret_{name}"), ctrl["ret"].rename(f"ret_{ctrl_name}")],
+                  axis=1, join="inner").dropna()
+    print(f"common days: {len(z)}   corr(eps_{name}, eps_{ctrl_name}) = "
+          f"{z[eps.name].corr(z[eps_c.name]):.3f}")
+    specs = [
+        [eps.name],
+        [eps.name, eps_c.name],
+        [eps.name, eps_c.name, f"ret_{name}", f"ret_{ctrl_name}"],
+    ]
+    for i, cols in enumerate(specs, 1):
+        X = z[cols].copy()
+        flow_cols = [c for c in cols if c.startswith("eps_")]
+        X[flow_cols] = X[flow_cols] / 100                      # flows per US$100m
+        res = _ols_hac(z["ret_next"], X)
+        terms = []
+        for c in cols:
+            b = res.params[c] * (100 if c in flow_cols else 1)
+            unit = "%/$100m" if c in flow_cols else ""
+            terms.append(f"{c}: {b:+.3f}{unit} (t={res.tvalues[c]:.2f})")
+        print(f"({i}) next-day ret_{name} ~ " + ", ".join(terms))
+
+
 # ============================================================ intraday timing of the effect
 def intraday_decomposition(df: pd.DataFrame, hourly: pd.Series, open_hour: int = 9,
                            max_h: int = 24) -> pd.DataFrame:
@@ -314,7 +361,7 @@ def intraday_decomposition(df: pd.DataFrame, hourly: pd.Series, open_hour: int =
 
 
 # ============================================================ figures
-def plot_overview(df: pd.DataFrame, ll: pd.DataFrame, out: str) -> None:
+def plot_overview(df: pd.DataFrame, ll: pd.DataFrame, out: str, asset: str = "BTC") -> None:
     fig, ax = plt.subplots(3, 1, figsize=(11, 11), gridspec_kw={"height_ratios": [2, 1.3, 1]})
 
     a = ax[0]
@@ -322,15 +369,15 @@ def plot_overview(df: pd.DataFrame, ll: pd.DataFrame, out: str) -> None:
     a.set_ylabel("Daily net flow (US$m)")
     a2 = a.twinx()
     a2.plot(df.index, df["price"], color="#333", lw=1.2)
-    a2.set_ylabel("BTC price at 16:00 ET (US$)")
-    a.set_title("BTC price and US spot ETF daily net flows")
+    a2.set_ylabel(f"{asset} price at 16:00 ET (US$)")
+    a.set_title(f"{asset} price and US spot {asset} ETF daily net flows")
 
     b = ax[1]
     b.scatter(df["flow_5d"], df["ret_5d"] * 100, s=8, alpha=0.5)
     b.axhline(0, color="grey", lw=0.8)
     b.axvline(0, color="grey", lw=0.8)
     b.set_xlabel("5-day cumulative ETF flow (US$m)   <- outflow | inflow ->")
-    b.set_ylabel("5-day BTC return (%)")
+    b.set_ylabel(f"5-day {asset} return (%)")
     b.set_title("Do ETF flows and price move in the same direction?")
     kw = dict(transform=b.transAxes, fontsize=9, color="#555")
     b.text(0.02, 0.97, "outflow, price up", va="top", ha="left", **kw)
@@ -344,7 +391,7 @@ def plot_overview(df: pd.DataFrame, ll: pd.DataFrame, out: str) -> None:
     c.set_xticks(ll.index)
     c.set_xticklabels(["3 days\nbefore", "2 days\nbefore", "day\nbefore", "same\nday",
                        "next\nday", "2 days\nafter", "3 days\nafter"])
-    c.set_xlabel("BTC return day, relative to the day of the ETF flow")
+    c.set_xlabel(f"{asset} return day, relative to the day of the ETF flow")
     c.set_ylabel("Spearman correlation")
     c.set_title("Do ETF flows chase price, or lead it?")
 
@@ -374,8 +421,11 @@ def plot_profile(prof: pd.DataFrame, out: str) -> None:
 # ============================================================ main
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--flows", help="flow CSV (Date, ..., Total in US$m); default: scrape Farside")
-    ap.add_argument("--start", default="2024-01-11")
+    ap.add_argument("--asset", choices=["BTC", "ETH"], default="BTC")
+    ap.add_argument("--flows", help="flow CSV (Date, ..., Total in US$m); default: scrape Farside (BTC only)")
+    ap.add_argument("--control-flows", help="flow CSV of a control asset (e.g. BTC when --asset ETH)")
+    ap.add_argument("--control-asset", choices=["BTC", "ETH"], default="BTC")
+    ap.add_argument("--start", default=None, help="default: ETF launch (BTC 2024-01-11, ETH 2024-07-23)")
     ap.add_argument("--end", default=None)
     ap.add_argument("--demo", action="store_true", help="run on synthetic data")
     ap.add_argument("--outdir", default="figures")
@@ -384,18 +434,22 @@ def main() -> None:
     import os
     os.makedirs(args.outdir, exist_ok=True)
 
+    asset = args.asset
+    args.start = args.start or {"BTC": "2024-01-11", "ETH": "2024-07-23"}[asset]
     hourly = None
     if args.demo:
         flows, price = make_demo()
     else:
+        if not args.flows and asset != "BTC":
+            raise SystemExit("--flows is required for ETH (run src/farside_to_csv.py --asset ETH)")
         flows = load_flows(args.flows) if args.flows else load_farside_flows(args.start, args.end)
-        hourly = load_hourly(args.start, args.end)
+        hourly = load_hourly(args.start, args.end, product=f"{asset}-USD")
         price = load_price_at_close(hourly)
 
     df = build_panel(flows, price)
     if len(df) < 130:
         raise ValueError(f"only {len(df)} usable days; at least ~130 are needed (120 for the expanding window)")
-    print(f"period: {df.index.min().date()} to {df.index.max().date()}  ({len(df)} trading days)\n")
+    print(f"{asset}  period: {df.index.min().date()} to {df.index.max().date()}  ({len(df)} trading days)\n")
 
     ll = lead_lag(df)
     print("== Lead-lag correlation (flow on day t vs. return on day t+k)\n", ll.round(3), "\n")
@@ -407,14 +461,22 @@ def main() -> None:
     residual_test(df)
     print("\n== Divergence days (5-day outflow, 5-day price up)")
     divergence_test(df)
-    plot_overview(df, ll, os.path.join(args.outdir, "btc_etf_flow.png"))
+    prefix = asset.lower()
+    plot_overview(df, ll, os.path.join(args.outdir, f"{prefix}_etf_flow.png"), asset)
+
+    if args.control_flows and not args.demo:
+        c_asset = args.control_asset
+        c_hourly = load_hourly(args.start, args.end, product=f"{c_asset}-USD")
+        ctrl = build_panel(load_flows(args.control_flows), load_price_at_close(c_hourly))
+        print(f"\n== {asset} residual flow, controlling for {c_asset} residual flow")
+        cross_asset_test(df, ctrl, asset, c_asset)
 
     if hourly is not None:
         print("\n== When does the residual-flow effect show up?")
         prof = intraday_decomposition(df, hourly)
         print("\ncumulative-return coefficient h hours after 16:00 ET (% per $100m)")
         print(prof.loc[[1, 4, 8, 12, 17, 20, 24]].round(3))
-        plot_profile(prof, os.path.join(args.outdir, "btc_etf_flow_intraday.png"))
+        plot_profile(prof, os.path.join(args.outdir, f"{prefix}_etf_flow_intraday.png"))
 
 
 if __name__ == "__main__":
